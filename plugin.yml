@@ -1,0 +1,29 @@
+package dev.duel.plugin.duel;
+
+import dev.duel.plugin.kit.KitType;
+
+import java.util.UUID;
+
+public class DuelRequest {
+
+    private final UUID sender;
+    private final UUID target;
+    private final KitType kit;
+    private final long createdAt;
+
+    public DuelRequest(UUID sender, UUID target, KitType kit) {
+        this.sender = sender;
+        this.target = target;
+        this.kit = kit;
+        this.createdAt = System.currentTimeMillis();
+    }
+
+    public UUID getSender() { return sender; }
+    public UUID getTarget() { return target; }
+    public KitType getKit() { return kit; }
+    public long getCreatedAt() { return createdAt; }
+
+    public boolean isExpired(int expireSeconds) {
+        return System.currentTimeMillis() - createdAt > (long) expireSeconds * 1000;
+    }
+}

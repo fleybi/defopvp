@@ -1,0 +1,312 @@
+package dev.duel.plugin.duel;
+
+import dev.duel.plugin.DuelPlugin;
+import dev.duel.plugin.arena.Arena;
+import dev.duel.plugin.kit.KitType;
+import dev.duel.plugin.stats.PlayerStats;
+import dev.duel.plugin.util.MessageUtil;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.title.Title;
+import org.bukkit.Bukkit;
+import org.bukkit.GameMode;
+import org.bukkit.Sound;
+import org.bukkit.entity.Player;
+import org.bukkit.scheduler.BukkitTask;
+
+import java.time.Duration;
+import java.util.*;
+
+public class DuelManager {
+
+    private final DuelPlugin plugin;
+    private final Map<UUID, Duel> activeDuels = new HashMap<>();
+    private final Map<UUID, DuelRequest> pendingRequests = new HashMap<>(); // target -> request
+    private final Map<UUID, UUID> spectatorMap = new HashMap<>(); // spectator -> duel player
+
+    public DuelManager(DuelPlugin plugin) {
+        this.plugin = plugin;
+        startExpiryTask();
+    }
+
+    // ==================== REQUESTS ====================
+
+    public void sendRequest(Player sender, Player target, KitType kit) {
+        if (isInDuel(sender.getUniqueId())) {
+            MessageUtil.send(sender, "&cYou are already in a duel!");
+            return;
+        }
+        if (isInDuel(target.getUniqueId())) {
+            MessageUtil.send(sender, "&c" + target.getName() + " is already in a duel!");
+            return;
+        }
+        if (plugin.getQueueManager().isInQueue(sender.getUniqueId())) {
+            MessageUtil.send(sender, "&cLeave the queue first! /leavequeue");
+            return;
+        }
+
+        int expire = plugin.getConfig().getInt("settings.request-expire-time", 30);
+        pendingRequests.put(target.getUniqueId(), new DuelRequest(sender.getUniqueId(), target.getUniqueId(), kit));
+
+        String kitColor = kit.getDisplayName();
+        MessageUtil.send(sender, "&7You sent a duel request to &e" + target.getName() + " &8[" + kitColor + "&8]");
+        MessageUtil.send(target, "&e" + sender.getName() + " &7challenged you to a &8[" + kitColor + "&8] &7duel!");
+        MessageUtil.send(target, "&7Type &a/duelaccept &7or &c/dueldeny &7(expires in " + expire + "s)");
+
+        target.playSound(target.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, 1f, 1.5f);
+    }
+
+    public void acceptRequest(Player target) {
+        DuelRequest request = pendingRequests.remove(target.getUniqueId());
+        if (request == null) {
+            MessageUtil.send(target, "&cYou have no pending duel requests.");
+            return;
+        }
+        if (request.isExpired(plugin.getConfig().getInt("settings.request-expire-time", 30))) {
+            MessageUtil.send(target, "&cThat duel request has expired.");
+            return;
+        }
+
+        Player sender = Bukkit.getPlayer(request.getSender());
+        if (sender == null || !sender.isOnline()) {
+            MessageUtil.send(target, "&cThat player is no longer online.");
+            return;
+        }
+
+        startDuel(sender, target, request.getKit());
+    }
+
+    public void denyRequest(Player target) {
+        DuelRequest request = pendingRequests.remove(target.getUniqueId());
+        if (request == null) {
+            MessageUtil.send(target, "&cYou have no pending duel requests.");
+            return;
+        }
+        Player sender = Bukkit.getPlayer(request.getSender());
+        if (sender != null) MessageUtil.send(sender, "&c" + target.getName() + " denied your duel request.");
+        MessageUtil.send(target, "&7You denied the duel request.");
+    }
+
+    // ==================== DUEL START ====================
+
+    public void startDuel(Player p1, Player p2, KitType kit) {
+        Arena arena = plugin.getArenaManager().getAvailableArena();
+        if (arena == null) {
+            MessageUtil.send(p1, "&cNo arenas available! Ask an admin to set one up.");
+            MessageUtil.send(p2, "&cNo arenas available! Ask an admin to set one up.");
+            return;
+        }
+        arena.setInUse(true);
+
+        Duel duel = new Duel(p1, p2, kit, arena);
+        activeDuels.put(p1.getUniqueId(), duel);
+        activeDuels.put(p2.getUniqueId(), duel);
+
+        // Teleport to arena
+        p1.teleport(arena.getSpawn1());
+        p2.teleport(arena.getSpawn2());
+
+        // Apply kit
+        plugin.getKitManager().applyKit(p1, kit);
+        plugin.getKitManager().applyKit(p2, kit);
+
+        // Freeze players briefly
+        p1.setWalkSpeed(0f);
+        p2.setWalkSpeed(0f);
+
+        int countdown = plugin.getConfig().getInt("settings.countdown-seconds", 5);
+        MessageUtil.broadcast(p1, p2, "&7A duel has started: &e" + p1.getName() + " &7vs &e" + p2.getName() + " &8[" + kit.getDisplayName() + "&8]");
+
+        // Countdown
+        BukkitTask[] task = new BukkitTask[1];
+        int[] count = {countdown};
+        task[0] = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+            if (count[0] > 0) {
+                showCountdown(p1, p2, count[0]);
+                count[0]--;
+            } else {
+                task[0].cancel();
+                duel.setState(Duel.State.ACTIVE);
+                p1.setWalkSpeed(0.2f);
+                p2.setWalkSpeed(0.2f);
+
+                showTitle(p1, "&c&lFIGHT!", "&7vs &e" + p2.getName());
+                showTitle(p2, "&c&lFIGHT!", "&7vs &e" + p1.getName());
+                p1.playSound(p1.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1f, 1.2f);
+                p2.playSound(p2.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1f, 1.2f);
+            }
+        }, 0L, 20L);
+    }
+
+    private void showCountdown(Player p1, Player p2, int count) {
+        showTitle(p1, "&e" + count, "&7Get ready...");
+        showTitle(p2, "&e" + count, "&7Get ready...");
+        p1.playSound(p1.getLocation(), Sound.BLOCK_NOTE_BLOCK_HAT, 0.8f, 1f);
+        p2.playSound(p2.getLocation(), Sound.BLOCK_NOTE_BLOCK_HAT, 0.8f, 1f);
+    }
+
+    // ==================== DUEL END ====================
+
+    public void endDuel(Duel duel, Player winner, Player loser, String reason) {
+        if (duel.getState() == Duel.State.ENDING) return;
+        duel.setState(Duel.State.ENDING);
+
+        activeDuels.remove(winner.getUniqueId());
+        activeDuels.remove(loser.getUniqueId());
+        plugin.getArenaManager().releaseArena(duel.getArena());
+
+        // ELO calculation
+        int winnerElo = plugin.getStatsManager().getElo(winner.getUniqueId());
+        int loserElo = plugin.getStatsManager().getElo(loser.getUniqueId());
+        int[] changes = calculateElo(winnerElo, loserElo);
+
+        plugin.getStatsManager().recordWin(winner.getUniqueId(), changes[0]);
+        plugin.getStatsManager().recordLoss(loser.getUniqueId(), changes[1]);
+
+        long duration = duel.getDurationMillis() / 1000;
+        String durationStr = duration + "s";
+
+        // Messages
+        showTitle(winner, "&a&lVICTORY!", "&7+" + changes[0] + " ELO");
+        showTitle(loser, "&c&lDEFEAT!", "&7-" + changes[1] + " ELO");
+
+        winner.playSound(winner.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 1f, 1f);
+        loser.playSound(loser.getLocation(), Sound.ENTITY_PLAYER_HURT, 1f, 0.8f);
+
+        MessageUtil.send(winner, "&a&lYou won &7against &e" + loser.getName() + "! &a(+" + changes[0] + " ELO) &7[" + durationStr + "]");
+        MessageUtil.send(loser, "&c&lYou lost &7against &e" + winner.getName() + ". &c(-" + changes[1] + " ELO) &7[" + durationStr + "]");
+
+        // Notify spectators
+        for (UUID specUUID : duel.getSpectators()) {
+            Player spec = Bukkit.getPlayer(specUUID);
+            if (spec != null) {
+                MessageUtil.send(spec, "&e" + winner.getName() + " &7won the duel! Teleporting you back...");
+                removeSpectator(spec);
+            }
+        }
+
+        // Restore and teleport back
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            restorePlayer(winner, duel, true);
+            restorePlayer(loser, duel, false);
+        }, 60L); // 3 second delay
+    }
+
+    private void restorePlayer(Player player, Duel duel, boolean isWinner) {
+        if (!player.isOnline()) return;
+
+        player.getInventory().clear();
+        player.getActivePotionEffects().forEach(e -> player.removePotionEffect(e.getType()));
+        player.setWalkSpeed(0.2f);
+
+        boolean returnAfter = plugin.getConfig().getBoolean("arena.return-after-duel", true);
+        if (returnAfter) {
+            org.bukkit.Location returnLoc = isWinner ? duel.getPlayer1Return() : duel.getPlayer2Return();
+            if (!duel.getPlayer1().equals(player.getUniqueId())) {
+                returnLoc = duel.getPlayer2Return();
+            }
+            player.teleport(returnLoc);
+        }
+
+        if (plugin.getConfig().getBoolean("arena.save-inventory", true)) {
+            ItemStack[] inv = isWinner ? duel.getPlayer1Inventory() : duel.getPlayer2Inventory();
+            ItemStack[] armor = isWinner ? duel.getPlayer1Armor() : duel.getPlayer2Armor();
+            if (!duel.getPlayer1().equals(player.getUniqueId())) {
+                inv = duel.getPlayer2Inventory();
+                armor = duel.getPlayer2Armor();
+            }
+            player.getInventory().setContents(inv);
+            player.getInventory().setArmorContents(armor);
+        }
+
+        if (plugin.getConfig().getBoolean("arena.restore-health", true)) {
+            player.setHealth(player.getMaxHealth());
+            player.setFoodLevel(20);
+        }
+    }
+
+    public void endAllDuels() {
+        Set<Duel> ended = new HashSet<>();
+        for (Duel duel : new ArrayList<>(activeDuels.values())) {
+            if (ended.contains(duel)) continue;
+            ended.add(duel);
+            plugin.getArenaManager().releaseArena(duel.getArena());
+            Player p1 = Bukkit.getPlayer(duel.getPlayer1());
+            Player p2 = Bukkit.getPlayer(duel.getPlayer2());
+            if (p1 != null) restorePlayer(p1, duel, true);
+            if (p2 != null) restorePlayer(p2, duel, false);
+        }
+        activeDuels.clear();
+    }
+
+    // ==================== SPECTATE ====================
+
+    public void addSpectator(Player spectator, Player duelist) {
+        Duel duel = activeDuels.get(duelist.getUniqueId());
+        if (duel == null) {
+            MessageUtil.send(spectator, "&c" + duelist.getName() + " is not in a duel.");
+            return;
+        }
+        if (isInDuel(spectator.getUniqueId())) {
+            MessageUtil.send(spectator, "&cYou can't spectate while in a duel.");
+            return;
+        }
+
+        spectatorMap.put(spectator.getUniqueId(), duelist.getUniqueId());
+        duel.addSpectator(spectator.getUniqueId());
+
+        spectator.setGameMode(GameMode.SPECTATOR);
+        spectator.teleport(duelist.getLocation());
+        MessageUtil.send(spectator, "&7Now spectating &e" + duelist.getName() + " &7vs &e" + Bukkit.getPlayer(duel.getOpponent(duelist.getUniqueId())).getName());
+        MessageUtil.send(spectator, "&7Type &c/leavequeue &7to stop spectating.");
+    }
+
+    public void removeSpectator(Player spectator) {
+        UUID watchingUUID = spectatorMap.remove(spectator.getUniqueId());
+        if (watchingUUID != null) {
+            Duel duel = activeDuels.get(watchingUUID);
+            if (duel != null) duel.removeSpectator(spectator.getUniqueId());
+        }
+        spectator.setGameMode(GameMode.SURVIVAL);
+        spectator.teleport(spectator.getWorld().getSpawnLocation());
+    }
+
+    public boolean isSpectating(UUID uuid) { return spectatorMap.containsKey(uuid); }
+
+    // ==================== HELPERS ====================
+
+    public Duel getDuel(UUID uuid) { return activeDuels.get(uuid); }
+    public boolean isInDuel(UUID uuid) { return activeDuels.containsKey(uuid); }
+
+    private int[] calculateElo(int winnerElo, int loserElo) {
+        int k = plugin.getConfig().getInt("elo.k-factor", 32);
+        double expected = 1.0 / (1 + Math.pow(10, (loserElo - winnerElo) / 400.0));
+        int change = (int) Math.round(k * (1 - expected));
+        change = Math.max(1, change);
+        return new int[]{change, change};
+    }
+
+    private void showTitle(Player player, String title, String subtitle) {
+        player.showTitle(Title.title(
+            MessageUtil.colorize(title),
+            MessageUtil.colorize(subtitle),
+            Title.Times.times(Duration.ofMillis(200), Duration.ofMillis(2000), Duration.ofMillis(500))
+        ));
+    }
+
+    private void startExpiryTask() {
+        int expireSeconds = plugin.getConfig().getInt("settings.request-expire-time", 30);
+        Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+            pendingRequests.entrySet().removeIf(entry -> {
+                if (entry.getValue().isExpired(expireSeconds)) {
+                    Player sender = Bukkit.getPlayer(entry.getValue().getSender());
+                    Player target = Bukkit.getPlayer(entry.getKey());
+                    if (sender != null) MessageUtil.send(sender, "&cYour duel request to &e" + (target != null ? target.getName() : "that player") + " &chas expired.");
+                    return true;
+                }
+                return false;
+            });
+        }, 20L * 5, 20L * 5);
+    }
+
+    public Map<UUID, DuelRequest> getPendingRequests() { return pendingRequests; }
+}
